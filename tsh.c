@@ -15,6 +15,13 @@
 #include <sys/wait.h>
 #include <errno.h>
 
+//#define DEBUG
+#ifdef DEBUG
+#define dbg_printf(...) printf(__VA_ARGS__)
+#else
+#define dbg_printf(...)
+#endif
+
 /* Misc manifest constants */
 #define MAXLINE    1024   /* max line size */
 #define MAXARGS     128   /* max args on a command line */
@@ -101,7 +108,7 @@ void unix_error(char *msg);
 void app_error(char *msg);
 typedef void handler_t(int);
 handler_t *Signal(int signum, handler_t *handler);
-
+void Sigprocmask(int how, const sigset_t *set, sigset_t *oldset);
 
 
 /*
@@ -199,13 +206,93 @@ eval(char *cmdline)
     struct cmdline_tokens tok;
 
     /* Parse command line */
-    bg = parseline(cmdline, &tok); 
-
-    if (bg == -1) /* parsing error */
+    if((bg = parseline(cmdline, &tok)) == -1)/* parsing error */
         return;
     if (tok.argv[0] == NULL) /* ignore empty lines */
         return;
-
+    
+    pid_t pid;
+    struct job_t *job;
+    sigset_t mask, oldmask;
+    sigaddset(&mask, SIGCHLD);
+    sigaddset(&mask, SIGINT);
+    sigaddset(&mask, SIGTSTP);
+    
+    if(tok.builtins == BUILTIN_QUIT)
+        exit(0);
+    else if(tok.builtins == BUILTIN_JOBS) {
+        if(tok.outfile) {
+            int fd_outfile = open(tok.outfile, O_WRONLY, 0);
+            listjobs(job_list, fd_outfile);
+            close(fd_outfile);
+        } else {
+            listjobs(job_list, STDOUT_FILENO);
+            fflush(stdout);
+        }
+    }
+    else if((tok.builtins == BUILTIN_FG) || (tok.builtins == BUILTIN_BG)) {
+        char *s = tok.argv[1];
+        if(s == NULL)
+            return;
+        else if(s[0] == '%') 
+            job = getjobjid(job_list, atoi(++s));
+        else 
+            job = getjobpid(job_list, atoi(s));
+        if(job == NULL)
+            return;
+        if(tok.builtins == BUILTIN_FG) {
+            Sigprocmask(SIG_BLOCK, &mask, &oldmask);
+            job->state = FG;
+            kill(job->pid, SIGCONT);
+            Sigprocmask(SIG_UNBLOCK, &mask, NULL);
+            while(fgpid(job_list))
+                sigsuspend(&oldmask);
+        } else {
+            job->state = BG;
+            kill(job->pid, SIGCONT);
+            printf("[%d] (%d) %s\n", job->jid, job->pid, job->cmdline);
+        }
+    } else {    
+        Sigprocmask(SIG_BLOCK, &mask, &oldmask);
+        if((pid = fork()) < 0)
+           unix_error("Fork error");
+        if(pid == 0) {
+            Sigprocmask(SIG_UNBLOCK, &mask, NULL);        
+            if(tok.infile) {
+                int fd_infile;
+                if((fd_infile = open(tok.infile, O_RDWR, 0)) == -1)
+                    unix_error("Unable to open the infile");
+                if((dup2(fd_infile, STDIN_FILENO)) == -1)
+                    unix_error("Descriptor copy error");
+                close(fd_infile);
+            }
+            if(tok.outfile) {
+                int fd_outfile;
+                if((fd_outfile = open(tok.outfile, O_RDWR, 0)) == -1)
+                    unix_error("Unable to open the outfile");
+                if((dup2(fd_outfile, STDOUT_FILENO)) == -1)
+                    unix_error("Descriptor copy error");
+                close(fd_outfile);
+            }
+            setpgid(0, 0);
+            if(execve(tok.argv[0], tok.argv, environ) < 0)
+                unix_error("Command not found");
+        }
+        dbg_printf("Process %d is created \n", pid);
+        if(!bg){
+            if((addjob(job_list, pid, FG, cmdline)) == 0)
+                unix_error("Failure to add jobs");
+            Sigprocmask(SIG_UNBLOCK, &mask, NULL);
+            while(fgpid(job_list))
+                sigsuspend(&oldmask);
+        } else  {
+            if((addjob(job_list, pid, BG, cmdline)) == 0)
+                unix_error("Failure to add jobs");
+            job = getjobpid(job_list, pid);
+            printf("[%d] (%d) %s\n", job->jid, pid, cmdline); 
+            Sigprocmask(SIG_UNBLOCK, &mask, NULL);
+        } 
+    }
     return;
 }
 
@@ -372,6 +459,29 @@ parseline(const char *cmdline, struct cmdline_tokens *tok)
 void 
 sigchld_handler(int sig) 
 {
+    pid_t pid;
+    int status;
+    struct job_t *job;
+    while((pid = waitpid(-1, &status, WNOHANG|WUNTRACED)) > 0) {
+        if((job = getjobpid(job_list, pid)) == NULL)
+            unix_error("Job location error");
+        if(WIFEXITED(status))
+            deletejob(job_list, job->pid); 
+        else if(WIFSIGNALED(status)) {
+            int sig2 = WTERMSIG(status);
+            printf("Job [%d] (%d) terminated by signal %d\n",
+                    job->jid, job->pid, sig2);
+            deletejob(job_list, job->pid); 
+        }
+        else if(WIFSTOPPED(status)) {
+            int sig2 = WSTOPSIG(status);
+            printf("Job [%d] (%d) stopped by signal %d\n",
+                    job->jid, job->pid, sig2);
+            job->state =ST;
+        }
+    }
+    if((pid == -1) && (errno != ECHILD))
+        unix_error("waitpid error");
     return;
 }
 
@@ -383,6 +493,9 @@ sigchld_handler(int sig)
 void 
 sigint_handler(int sig) 
 {
+    pid_t pid = fgpid(job_list);
+    if(pid)
+        kill(-pid, SIGINT);
     return;
 }
 
@@ -394,6 +507,9 @@ sigint_handler(int sig)
 void 
 sigtstp_handler(int sig) 
 {
+    pid_t pid = fgpid(job_list);
+    if(pid)
+        kill(-pid, SIGTSTP);
     return;
 }
 
@@ -649,3 +765,10 @@ sigquit_handler(int sig)
     exit(1);
 }
 
+/* $end sigaction */
+void Sigprocmask(int how, const sigset_t *set, sigset_t *oldset)
+{
+    if (sigprocmask(how, set, oldset) < 0)
+	unix_error("Sigprocmask error");
+    return;
+}
